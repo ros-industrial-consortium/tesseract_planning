@@ -27,7 +27,6 @@
 #include <trajopt_ifopt/trajopt_ifopt.h>
 #include <tesseract_motion_planners/trajopt_ifopt/trajopt_ifopt_problem.h>
 #include <tesseract_command_language/types.h>
-#include <trajopt_ifopt/constraints/collision_evaluators.h>
 
 #include <ifopt/problem.h>
 
@@ -137,10 +136,11 @@ createCollisionConstraints(std::vector<trajopt::JointPosition::ConstPtr> vars,
     auto adjacency_map = std::make_shared<tesseract_environment::AdjacencyMap>(
         env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
 
-    auto collision_evaluator = std::make_shared<trajopt::DiscreteCollisionEvaluator>(
+    auto collision_evaluator = std::make_shared<trajopt::SingleTimestepCollisionEvaluator>(
         kin, env, adjacency_map, Eigen::Isometry3d::Identity(), *config);
 
-    constraints.push_back(std::make_shared<trajopt::CollisionConstraintIfopt>(collision_evaluator, var));
+    constraints.push_back(std::make_shared<trajopt::DiscreteCollisionConstraintIfopt>(
+        collision_evaluator, trajopt::CombineCollisionDataMethod::WEIGHTED_AVERAGE, var));
   }
 
   return constraints;

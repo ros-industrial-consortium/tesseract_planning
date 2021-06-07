@@ -32,7 +32,8 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <vector>
 #include <Eigen/Geometry>
 #include <Eigen/Core>
-#include <trajopt_ifopt/constraints/collision_evaluators.h>
+#include <trajopt_ifopt/constraints/discrete_collision_evaluators.h>
+#include <trajopt_ifopt/constraints/continuous_collision_evaluators.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_profile.h>

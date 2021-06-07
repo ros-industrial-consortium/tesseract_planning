@@ -31,7 +31,8 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <ifopt/constraint_set.h>
 #include <ifopt/problem.h>
 #include <trajopt_ifopt/trajopt_ifopt.h>
-#include <trajopt_ifopt/constraints/collision_evaluators.h>
+#include <trajopt_ifopt/constraints/discrete_collision_evaluators.h>
+#include <trajopt_ifopt/constraints/continuous_collision_evaluators.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 #include <tesseract_command_language/types.h>
