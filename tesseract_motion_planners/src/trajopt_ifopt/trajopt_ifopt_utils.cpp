@@ -126,21 +126,74 @@ createCollisionConstraints(std::vector<trajopt::JointPosition::ConstPtr> vars,
   if (config->type == tesseract_collision::CollisionEvaluatorType::NONE)
     return constraints;
 
-  if (config->type != tesseract_collision::CollisionEvaluatorType::DISCRETE)
-    CONSOLE_BRIDGE_logWarn("Only Single timestep collision is supported for trajopt_ifopt. PRs welcome");
-
   // Add a collision cost for all steps
-  for (const auto& var : vars)
+  auto collision_cache = std::make_shared<trajopt::CollisionCache>(vars.size());
+  if (config->type == tesseract_collision::CollisionEvaluatorType::DISCRETE)
   {
-    auto kin = env->getManipulatorManager()->getFwdKinematicSolver(manip_info.manipulator);
-    auto adjacency_map = std::make_shared<tesseract_environment::AdjacencyMap>(
-        env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
+    for (const auto& var : vars)
+    {
+      auto kin = env->getManipulatorManager()->getFwdKinematicSolver(manip_info.manipulator);
+      auto adjacency_map = std::make_shared<tesseract_environment::AdjacencyMap>(
+          env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
 
-    auto collision_evaluator = std::make_shared<trajopt::SingleTimestepCollisionEvaluator>(
-        kin, env, adjacency_map, Eigen::Isometry3d::Identity(), *config);
+      auto collision_evaluator = std::make_shared<trajopt::SingleTimestepCollisionEvaluator>(
+          collision_cache, kin, env, adjacency_map, Eigen::Isometry3d::Identity(), config);
 
-    constraints.push_back(std::make_shared<trajopt::DiscreteCollisionConstraintIfopt>(
-        collision_evaluator, trajopt::CombineCollisionDataMethod::WEIGHTED_AVERAGE, var));
+      constraints.push_back(std::make_shared<trajopt::DiscreteCollisionConstraintIfopt>(
+          collision_evaluator,
+          trajopt::DiscreteCombineCollisionData(trajopt::CombineCollisionDataMethod::WEIGHTED_AVERAGE),
+          var));
+    }
+  }
+  else if (config->type == tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE)
+  {
+    for (std::size_t i = 0; i < vars.size(); ++i)
+    {
+      auto kin = env->getManipulatorManager()->getFwdKinematicSolver(manip_info.manipulator);
+      auto adjacency_map = std::make_shared<tesseract_environment::AdjacencyMap>(
+          env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
+
+      auto collision_evaluator = std::make_shared<trajopt::LVSDiscreteCollisionEvaluator>(
+          collision_cache, kin, env, adjacency_map, Eigen::Isometry3d::Identity(), config);
+
+      std::array<trajopt::JointPosition::ConstPtr, 3> position_vars;
+      if (i == 0)
+        position_vars = { nullptr, vars[i], vars[i + 1] };
+      else if (i == vars.size() - 1)
+        position_vars = { vars[i - 1], vars[i], nullptr };
+      else
+        position_vars = { vars[i - 1], vars[i], vars[i + 1] };
+
+      constraints.push_back(std::make_shared<trajopt::ContinuousCollisionConstraintIfopt>(
+          collision_evaluator,
+          trajopt::ContinuousCombineCollisionData(trajopt::CombineCollisionDataMethod::WEIGHTED_AVERAGE),
+          position_vars));
+    }
+  }
+  else
+  {
+    for (std::size_t i = 0; i < vars.size(); ++i)
+    {
+      auto kin = env->getManipulatorManager()->getFwdKinematicSolver(manip_info.manipulator);
+      auto adjacency_map = std::make_shared<tesseract_environment::AdjacencyMap>(
+          env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
+
+      auto collision_evaluator = std::make_shared<trajopt::LVSContinuousCollisionEvaluator>(
+          collision_cache, kin, env, adjacency_map, Eigen::Isometry3d::Identity(), config);
+
+      std::array<trajopt::JointPosition::ConstPtr, 3> position_vars;
+      if (i == 0)
+        position_vars = { nullptr, vars[i], vars[i + 1] };
+      else if (i == vars.size() - 1)
+        position_vars = { vars[i - 1], vars[i], nullptr };
+      else
+        position_vars = { vars[i - 1], vars[i], vars[i + 1] };
+
+      constraints.push_back(std::make_shared<trajopt::ContinuousCollisionConstraintIfopt>(
+          collision_evaluator,
+          trajopt::ContinuousCombineCollisionData(trajopt::CombineCollisionDataMethod::WEIGHTED_AVERAGE),
+          position_vars));
+    }
   }
 
   return constraints;
