@@ -43,6 +43,9 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
                                     const TrajOptIfoptPlanProfileMap& plan_profiles,
                                     const TrajOptIfoptCompositeProfileMap& composite_profiles)
 {
+  // Store fixed steps
+  std::vector<int> fixed_steps;
+
   // Create the problem
   auto problem = std::make_shared<TrajOptIfoptProblem>();
   problem->environment = request.env;
@@ -59,16 +62,31 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
   problem->manip_fwd_kin = kin;
   problem->manip_inv_kin = inv_kin;
 
+  // Apply Solver parameters
+  std::string profile = request.instructions.getProfile();
+  ProfileDictionary::ConstPtr profile_overrides = request.instructions.profile_overrides;
+  profile = getProfileString(profile, name, PlannerProfileRemapping());
+  //  TrajOptSolverProfile::ConstPtr solver_profile =
+  //      getProfile<TrajOptSolverProfile>(profile, solver_profiles, std::make_shared<TrajOptDefaultSolverProfile>());
+  //  solver_profile = applyProfileOverrides(name, solver_profile, profile_overrides);
+  //  if (!solver_profile)
+  //    throw std::runtime_error("TrajOptSolverConfig: Invalid profile");
+
+  //  solver_profile->apply(*pci);
+
+  // Flatten input instructions
+  auto instructions_flat = flattenProgram(request.instructions);
+  auto seed_flat_pattern = flattenProgramToPattern(request.seed, request.instructions);
+  auto seed_flat = flattenProgram(request.seed);
+
   // Get kinematics information
   tesseract_environment::Environment::ConstPtr env = request.env;
   tesseract_environment::AdjacencyMap map(
       env->getSceneGraph(), kin->getActiveLinkNames(), env->getCurrentState()->link_transforms);
   const std::vector<std::string>& active_links = map.getActiveLinkNames();
 
-  // Flatten input instructions
-  auto instructions_flat = flattenProgram(request.instructions);
-  auto seed_flat_pattern = flattenProgramToPattern(request.seed, request.instructions);
-  auto seed_flat = flattenProgram(request.seed);
+  // Check seed should have start instruction
+  assert(request.seed.hasStartInstruction());
 
   // ----------------
   // Setup variables
@@ -80,8 +98,8 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
   for (std::size_t i = 0; i < seed_flat.size(); i++)
   {
     assert(isMoveInstruction(seed_flat[i]));
-    auto var = std::make_shared<trajopt::JointPosition>(
-        getJointPosition(seed_flat[i].get().as<MoveInstruction>().getWaypoint()),
+    auto var = std::make_shared<trajopt_ifopt::JointPosition>(
+        getJointPosition(kin->getJointNames(), seed_flat[i].get().as<MoveInstruction>().getWaypoint()),
         kin->getJointNames(),
         "Joint_Position_" + std::to_string(i));
     var->SetBounds(joint_limits_eigen);
@@ -89,15 +107,9 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
     problem->nlp->AddVariableSet(var);
   }
 
-  // Store fixed steps
-  std::vector<int> fixed_steps;
-
-  // ----------------
   // Setup start waypoint
-  // ----------------
-  int start_index = 0;  // If it has a start instruction then skip first instruction in instructions_flat
+  std::size_t start_index = 0;  // If it has a start instruction then skip first instruction in instructions_flat
   int index = 0;
-  std::string profile;
   Waypoint start_waypoint{ NullWaypoint() };
   Instruction placeholder_instruction{ NullInstruction() };
   const Instruction* start_instruction = nullptr;
@@ -111,6 +123,7 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
       assert(temp.isStart());
       start_waypoint = temp.getWaypoint();
       profile = temp.getProfile();
+      profile_overrides = temp.profile_overrides;
     }
     else
     {
@@ -118,8 +131,7 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
     }
     ++start_index;
   }
-  // If not start instruction is given, take the current state
-  else
+  else  // If not start instruction is given, take the current state
   {
     Eigen::VectorXd current_jv = request.env_state->getJointValues(kin->getJointNames());
     StateWaypoint swp(kin->getJointNames(), current_jv);
@@ -130,13 +142,56 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
     start_waypoint = swp;
   }
 
+  profile = getProfileString(profile, name, request.plan_profile_remapping);
+  TrajOptIfoptPlanProfile::ConstPtr start_plan_profile =
+      getProfile<TrajOptIfoptPlanProfile>(profile, plan_profiles, std::make_shared<TrajOptIfoptDefaultPlanProfile>());
+  start_plan_profile = applyProfileOverrides(name, start_plan_profile, profile_overrides);
+  if (!start_plan_profile)
+    throw std::runtime_error("TrajOptIfoptPlannerUniversalConfig: Invalid profile");
+
+  // Add start waypoint
+  if (isCartesianWaypoint(start_waypoint))
+  {
+    const auto& cwp = start_waypoint.as<CartesianWaypoint>();
+    start_plan_profile->apply(*problem, cwp.waypoint, *start_instruction, composite_mi, active_links, index);
+  }
+  else if (isJointWaypoint(start_waypoint) || isStateWaypoint(start_waypoint))
+  {
+    assert(checkJointPositionFormat(problem->manip_fwd_kin->getJointNames(), start_waypoint));
+    bool toleranced = false;
+
+    if (isJointWaypoint(start_waypoint))
+    {
+      toleranced = start_waypoint.as<JointWaypoint>().isToleranced();
+      start_plan_profile->apply(
+          *problem, start_waypoint.as<JointWaypoint>(), *start_instruction, composite_mi, active_links, index);
+    }
+    else if (isStateWaypoint(start_waypoint))
+    {
+      JointWaypoint jwp(start_waypoint.as<StateWaypoint>().joint_names, start_waypoint.as<StateWaypoint>().position);
+      start_plan_profile->apply(*problem, jwp, *start_instruction, composite_mi, active_links, index);
+    }
+    else
+      throw std::runtime_error("Unsupported start_waypoint type.");
+
+    // Add to fixed indices
+    if (!toleranced)
+      fixed_steps.push_back(index);
+  }
+  else
+  {
+    throw std::runtime_error("TrajOpt Problem Generator: unknown waypoint type.");
+  }
+
+  ++index;
+
   // ----------------
   // Translate TCL for PlanInstructions
   // ----------------
   // Transform plan instructions into trajopt cost and constraints
-  for (int i = start_index; i < static_cast<int>(instructions_flat.size()); i++)
+  for (std::size_t i = start_index; i < instructions_flat.size(); i++)
   {
-    const auto& instruction = instructions_flat[static_cast<std::size_t>(i)].get();
+    const auto& instruction = instructions_flat[i].get();
     if (isPlanInstruction(instruction))
     {
       assert(isPlanInstruction(instruction));
@@ -146,9 +201,8 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
       ManipulatorInfo manip_info = composite_mi.getCombined(plan_instruction.getManipulatorInfo());
       Eigen::Isometry3d tcp = request.env->findTCP(manip_info);
 
-      assert(isCompositeInstruction(seed_flat_pattern[static_cast<std::size_t>(i)].get()));
-      const auto& seed_composite =
-          seed_flat_pattern[static_cast<std::size_t>(i)].get().as<tesseract_planning::CompositeInstruction>();
+      assert(isCompositeInstruction(seed_flat_pattern[i].get()));
+      const auto& seed_composite = seed_flat_pattern[i].get().as<tesseract_planning::CompositeInstruction>();
       auto interpolate_cnt = static_cast<int>(seed_composite.size());
 
       std::string profile = getProfileString(plan_instruction.getProfile(), name, request.plan_profile_remapping);
@@ -171,6 +225,7 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
           }
           else if (isJointWaypoint(start_waypoint) || isStateWaypoint(start_waypoint))
           {
+            assert(checkJointPositionFormat(kin->getJointNames(), start_waypoint));
             const Eigen::VectorXd& position = getJointPosition(start_waypoint);
             prev_pose = kin->calcFwdKin(position);
             prev_pose = env->getCurrentState()->link_transforms.at(kin->getBaseLinkName()) * prev_pose * tcp;
@@ -186,31 +241,33 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
           {
             /** @todo Write a path constraint for this*/
             cur_plan_profile->apply(*problem, poses[p], plan_instruction, composite_mi, active_links, index);
-
             ++index;
           }
 
           // Add final point with waypoint
           cur_plan_profile->apply(*problem, cur_wp, plan_instruction, composite_mi, active_links, index);
-
           ++index;
         }
         else if (isJointWaypoint(plan_instruction.getWaypoint()) || isStateWaypoint(plan_instruction.getWaypoint()))
         {
-          const JointWaypoint* cur_position;
-          std::shared_ptr<const JointWaypoint> temp;
+          assert(checkJointPositionFormat(kin->getJointNames(), plan_instruction.getWaypoint()));
+          bool toleranced = false;
+
+          JointWaypoint cur_position;
           if (isJointWaypoint(plan_instruction.getWaypoint()))
           {
-            cur_position = &plan_instruction.getWaypoint().as<JointWaypoint>();
+            toleranced = plan_instruction.getWaypoint().as<JointWaypoint>().isToleranced();
+            cur_position = plan_instruction.getWaypoint().as<JointWaypoint>();
           }
-          else
+          else if (isStateWaypoint(plan_instruction.getWaypoint()))
           {
             const StateWaypoint& state_waypoint = plan_instruction.getWaypoint().as<StateWaypoint>();
-            temp = std::make_shared<JointWaypoint>(state_waypoint.joint_names, state_waypoint.position);
-            cur_position = temp.get();
+            cur_position = JointWaypoint(state_waypoint.joint_names, state_waypoint.position);
           }
+          else
+            throw std::runtime_error("Unsupported waypoint type.");
 
-          Eigen::Isometry3d cur_pose = kin->calcFwdKin(*cur_position);
+          Eigen::Isometry3d cur_pose = kin->calcFwdKin(cur_position);
           cur_pose = env->getCurrentState()->link_transforms.at(kin->getBaseLinkName()) * cur_pose * tcp;
 
           Eigen::Isometry3d prev_pose = Eigen::Isometry3d::Identity();
@@ -220,6 +277,7 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
           }
           else if (isJointWaypoint(start_waypoint) || isStateWaypoint(start_waypoint))
           {
+            assert(checkJointPositionFormat(problem->manip_fwd_kin->getJointNames(), start_waypoint));
             const Eigen::VectorXd& position = getJointPosition(start_waypoint);
             prev_pose = kin->calcFwdKin(position);
             prev_pose = env->getCurrentState()->link_transforms.at(kin->getBaseLinkName()) * prev_pose * tcp;
@@ -235,12 +293,15 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
           {
             /** @todo Add path constraint for this */
             cur_plan_profile->apply(*problem, poses[p], plan_instruction, composite_mi, active_links, index);
-
             ++index;
           }
 
           // Add final point with waypoint
-          cur_plan_profile->apply(*problem, *cur_position, plan_instruction, composite_mi, active_links, index);
+          cur_plan_profile->apply(*problem, cur_position, plan_instruction, composite_mi, active_links, index);
+
+          // Add to fixed indices
+          if (!toleranced)
+            fixed_steps.push_back(index);
 
           ++index;
         }
@@ -253,30 +314,35 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
       {
         if (isJointWaypoint(plan_instruction.getWaypoint()) || isStateWaypoint(plan_instruction.getWaypoint()))
         {
-          const JointWaypoint* cur_position;
-          std::shared_ptr<const JointWaypoint> temp;
+          assert(checkJointPositionFormat(kin->getJointNames(), plan_instruction.getWaypoint()));
+
+          // Add intermediate points with path costs and constraints
+          for (std::size_t s = 0; s < seed_composite.size() - 1; ++s)
+            ++index;
+
+          bool toleranced = false;
+
+          // Add final point with waypoint costs and contraints
+          JointWaypoint cur_position;
           if (isJointWaypoint(plan_instruction.getWaypoint()))
           {
-            cur_position = &plan_instruction.getWaypoint().as<JointWaypoint>();
+            cur_position = plan_instruction.getWaypoint().as<JointWaypoint>();
+            toleranced = cur_position.isToleranced();
           }
-          else
+          else if (isStateWaypoint(plan_instruction.getWaypoint()))
           {
             const auto& state_waypoint = plan_instruction.getWaypoint().as<StateWaypoint>();
-            temp = std::make_shared<JointWaypoint>(state_waypoint.joint_names, state_waypoint.position);
-            cur_position = temp.get();
+            cur_position = JointWaypoint(state_waypoint.joint_names, state_waypoint.position);
           }
-
-          // Increment index to account for intermediate points in seed
-          for (std::size_t s = 0; s < seed_composite.size() - 1; ++s)
-          {
-            ++i;
-          }
+          else
+            throw std::runtime_error("Unsupported start_waypoint type.");
 
           /** @todo Should check that the joint names match the order of the manipulator */
-          cur_plan_profile->apply(*problem, *cur_position, plan_instruction, manip_info, active_links, i);
+          cur_plan_profile->apply(*problem, cur_position, plan_instruction, manip_info, active_links, index);
 
           // Add to fixed indices
-          fixed_steps.push_back(i);
+          if (!toleranced)
+            fixed_steps.push_back(index);
         }
         else if (isCartesianWaypoint(plan_instruction.getWaypoint()))
         {
@@ -284,22 +350,18 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
 
           // Increment index to account for intermediate points in seed
           for (std::size_t s = 0; s < seed_composite.size() - 1; ++s)
-          {
-            ++i;
-          }
+            ++index;
 
+          // Add final point with waypoint costs and contraints
           /** @todo Should check that the joint names match the order of the manipulator */
-          cur_plan_profile->apply(*problem, cur_wp, plan_instruction, manip_info, active_links, i);
-
-          // Add to fixed indices
-          fixed_steps.push_back(i);
+          cur_plan_profile->apply(*problem, cur_wp, plan_instruction, manip_info, active_links, index);
         }
         else
         {
           throw std::runtime_error("DefaultTrajoptIfoptProblemGenerator: unknown waypoint type");
         }
 
-        ++i;
+        ++index;
       }
       else
       {
@@ -321,7 +383,7 @@ DefaultTrajOptIfoptProblemGenerator(const std::string& name,
     throw std::runtime_error("DefaultTrajoptIfoptProblemGenerator: Invalid profile");
 
   cur_composite_profile->apply(
-      *problem, 0, static_cast<int>(problem->vars.size()), composite_mi, active_links, fixed_steps);
+      *problem, 0, static_cast<int>(problem->vars.size()) - 1, composite_mi, active_links, fixed_steps);
 
   // ----------------
   // Return problem
